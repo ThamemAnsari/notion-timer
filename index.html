@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Everest Timer</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
+
+    * { margin: 0; padding: 0; box-sizing: border-box; user-select: none; }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: transparent;
+      width: 100%;
+      overflow: hidden;
+    }
+
+    .widget {
+      background: #f2f2f7;
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      position: relative;
+      border-radius: 16px;
+      overflow: hidden;
+      border: 1px solid rgba(0,0,0,0.08);
+    }
+
+    /* ── Drag bar ── */
+    .drag-bar {
+      background: #f2f2f7;
+      height: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 14px;
+      cursor: grab;
+      flex-shrink: 0;
+      border-bottom: 1px solid rgba(0,0,0,0.06);
+    }
+    .drag-bar:active { cursor: grabbing; }
+    .drag-title { font-size: 11px; font-weight: 600; color: #1c1c1e; letter-spacing: 0.01em; }
+    .drag-controls { display: flex; gap: 6px; align-items: center; }
+    .drag-controls button {
+      background: none; border: none; cursor: pointer; width: 20px; height: 20px;
+      border-radius: 50%; display: flex; align-items: center; justify-content: center;
+      font-size: 10px; color: #8e8e93; transition: background 0.15s, color 0.15s;
+    }
+    .drag-controls button:hover { background: rgba(0,0,0,0.07); color: #1c1c1e; }
+
+    /* ── Tab bar ── */
+    .tab-bar {
+      display: flex;
+      background: #f2f2f7;
+      border-bottom: 1px solid rgba(0,0,0,0.07);
+      flex-shrink: 0;
+    }
+    .tab-btn {
+      flex: 1; height: 34px; border: none; background: transparent;
+      font-family: 'Inter', -apple-system, sans-serif;
+      font-size: 10px; font-weight: 500; color: #8e8e93;
+      cursor: pointer; display: flex; align-items: center; justify-content: center;
+      gap: 4px; border-bottom: 2px solid transparent; transition: all 0.15s;
+    }
+    .tab-btn:hover { color: #1c1c1e; }
+    .tab-btn.active { color: #007aff; border-bottom-color: #007aff; }
+    .tab-btn .tab-icon { font-size: 13px; }
+
+    /* ── Tab panels ── */
+    .tab-panel { display: none; flex-direction: column; }
+    .tab-panel.active { display: flex; }
+
+    /* ══════════════════════════════
+       TIMER TAB  (original layout)
+    ══════════════════════════════ */
+
+    /* Queue strip */
+    .task-queue {
+      background: #f2f2f7;
+      padding: 4px 14px 6px;
+      display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+    }
+    .queue-label { font-size: 10px; font-weight: 500; color: #aeaeb2; letter-spacing: 0.04em; text-transform: uppercase; flex-shrink: 0; }
+    .queue-dots { display: flex; gap: 4px; align-items: center; flex: 1; overflow: hidden; }
+    .q-dot { width: 5px; height: 5px; border-radius: 50%; background: #d1d1d6; flex-shrink: 0; }
+    .queue-count { font-size: 10px; font-weight: 500; color: #aeaeb2; flex-shrink: 0; }
+    .queue-count.loaded { color: #007aff; }
+
+    /* Dropdown row */
+    #taskSelectorRow {
+      background: #f2f2f7;
+      padding: 0 12px 8px;
+      display: flex; align-items: center; gap: 8px;
+    }
+    #taskDropdown {
+      flex: 1; background: white; color: #1c1c1e;
+      border: 1px solid rgba(0,0,0,0.1);
+      font-family: 'Inter', -apple-system, sans-serif;
+      font-size: 11px; font-weight: 400; padding: 6px 10px;
+      border-radius: 10px; outline: none; cursor: pointer;
+      appearance: none; -webkit-appearance: none;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    }
+    #taskDropdown:focus { border-color: rgba(0,122,255,0.4); }
+    #btnRefreshTasks {
+      background: white; border: 1px solid rgba(0,0,0,0.1); color: #8e8e93;
+      font-size: 13px; width: 28px; height: 28px; cursor: pointer;
+      border-radius: 50%; display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0; box-shadow: 0 1px 3px rgba(0,0,0,0.06); transition: background 0.15s;
+    }
+    #btnRefreshTasks:hover { background: #f2f2f7; }
+
+    /* Timer card */
+    .timer-display {
+      background: white; margin: 0 10px; border-radius: 14px;
+      border: 1px solid rgba(0,0,0,0.06);
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; gap: 4px; padding: 12px 16px;
+    }
+    .time {
+      font-size: 48px; font-weight: 300; color: #1c1c1e;
+      letter-spacing: -0.02em; line-height: 1;
+      font-variant-numeric: tabular-nums; transition: color 0.3s;
+    }
+    .time.running { color: #007aff; font-weight: 400; }
+    .time.paused  { color: #aeaeb2; }
+    .time.break   { color: #5856d6; }
+
+    .task-label {
+      font-size: 10px; font-weight: 500; color: #aeaeb2;
+      text-transform: uppercase; letter-spacing: 0.06em;
+      max-width: 300px; overflow: hidden; text-overflow: ellipsis;
+      white-space: nowrap; text-align: center; min-height: 13px;
+    }
+    .task-label.active { color: #007aff; }
+    .task-label.paused { color: #aeaeb2; }
+    .task-label.break  { color: #5856d6; }
+
+    /* Controls */
+    .controls { display: flex; gap: 6px; padding: 8px 10px 4px; flex-shrink: 0; }
+    .btn {
+      flex: 1; height: 32px; border: none; cursor: pointer;
+      font-family: 'Inter', -apple-system, sans-serif;
+      font-size: 11px; font-weight: 500; letter-spacing: 0.01em;
+      border-radius: 10px; transition: all 0.15s;
+    }
+    .btn-start { background: #007aff; color: white; flex: 2; }
+    .btn-start:hover:not(:disabled) { background: #0071f3; }
+    .btn-start:active:not(:disabled) { background: #006de8; transform: scale(0.98); }
+    .btn-start:disabled { background: #d1d1d6; color: #aeaeb2; cursor: default; }
+    .btn-pause { background: #e5e5ea; color: #636366; }
+    .btn-pause.active { background: #fff3b0; color: #a05c00; }
+    .btn-pause.active:hover { background: #ffeea0; }
+    .btn-pause:hover { background: #d8d8de; }
+    .btn-stop { background: #e5e5ea; color: #636366; }
+    .btn-stop.active { background: #ffe3e3; color: #c0392b; }
+    .btn-stop.active:hover { background: #ffd5d5; }
+    .btn-stop:hover { background: #d8d8de; }
+    .btn-sync { background: #e5e5ea; color: #636366; font-size: 15px; flex: 0 0 32px; }
+    .btn-sync.ready  { background: #e8f4ff; color: #007aff; }
+    .btn-sync.ready:hover { background: #d5eaff; }
+    .btn-sync.syncing { color: #aeaeb2; animation: spin 1s linear infinite; }
+    .btn-sync.synced  { background: #e8fff0; color: #34c759; }
+    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+    /* Break buttons */
+    .break-controls { display: flex; gap: 6px; padding: 0 10px 8px; flex-shrink: 0; }
+    .btn-break {
+      flex: 1; height: 24px; border: none; cursor: pointer;
+      font-family: 'Inter', -apple-system, sans-serif;
+      font-size: 9px; font-weight: 500; letter-spacing: 0.03em;
+      border-radius: 8px; background: #e5e5ea; color: #8e8e93; transition: all 0.15s;
+    }
+    .btn-break:hover { background: #d8d8de; color: #636366; }
+    .btn-break.active { background: #eeeeff; color: #5856d6; }
+    .btn-break.active:hover { background: #e4e4fa; }
+
+    /* ══════════════════════════════
+       CHROME TABS TAB
+    ══════════════════════════════ */
+    .chrome-panel { padding: 10px; display: flex; flex-direction: column; gap: 6px; min-height: 160px; }
+    .chrome-header {
+      display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px;
+    }
+    .chrome-title { font-size: 10px; font-weight: 600; color: #aeaeb2; text-transform: uppercase; letter-spacing: 0.05em; }
+    .chrome-refresh { background: none; border: none; cursor: pointer; font-size: 13px; color: #8e8e93; }
+    .chrome-tab-item {
+      background: white; border-radius: 10px; border: 1px solid rgba(0,0,0,0.07);
+      padding: 7px 10px; display: flex; align-items: center; gap: 8px;
+    }
+    .chrome-favicon {
+      width: 16px; height: 16px; border-radius: 3px; background: #e5e5ea;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 10px; flex-shrink: 0; overflow: hidden;
+    }
+    .chrome-tab-title { font-size: 11px; color: #1c1c1e; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .chrome-tab-domain { font-size: 9px; color: #aeaeb2; }
+    .chrome-empty { text-align: center; padding: 24px 0; color: #aeaeb2; font-size: 11px; }
+    .chrome-connect-btn {
+      margin: 0 auto; display: block; padding: 6px 16px;
+      background: #007aff; color: white; border: none; border-radius: 8px;
+      font-size: 11px; font-weight: 500; cursor: pointer; margin-top: 8px;
+    }
+
+    /* ══════════════════════════════
+       STATS TAB
+    ══════════════════════════════ */
+    .stats-panel { padding: 10px; display: flex; flex-direction: column; gap: 8px; min-height: 160px; }
+    .stats-header { display: flex; align-items: center; justify-content: space-between; }
+    .stats-title { font-size: 10px; font-weight: 600; color: #aeaeb2; text-transform: uppercase; letter-spacing: 0.05em; }
+    .stats-today { font-size: 10px; color: #007aff; font-weight: 500; }
+    .stats-summary {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
+    }
+    .stats-card {
+      background: white; border-radius: 10px; border: 1px solid rgba(0,0,0,0.07);
+      padding: 10px 12px;
+    }
+    .stats-card-val { font-size: 20px; font-weight: 300; color: #1c1c1e; }
+    .stats-card-lbl { font-size: 9px; color: #aeaeb2; font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 2px; }
+    .stats-history { background: white; border-radius: 10px; border: 1px solid rgba(0,0,0,0.07); overflow: hidden; }
+    .stats-row {
+      display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+      border-bottom: 1px solid rgba(0,0,0,0.05);
+    }
+    .stats-row:last-child { border-bottom: none; }
+    .stats-dot { width: 6px; height: 6px; border-radius: 50%; background: #34c759; flex-shrink: 0; }
+    .stats-task-name { font-size: 11px; color: #1c1c1e; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .stats-dur { font-size: 10px; color: #8e8e93; font-weight: 500; flex-shrink: 0; }
+    .stats-empty { text-align: center; padding: 24px 0; color: #aeaeb2; font-size: 11px; }
+
+    /* ══════════════════════════════
+       SETTINGS TAB
+    ══════════════════════════════ */
+    .settings-panel { padding: 10px; display: flex; flex-direction: column; gap: 8px; min-height: 160px; }
+    .settings-group { background: white; border-radius: 10px; border: 1px solid rgba(0,0,0,0.07); overflow: hidden; }
+    .settings-row {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 9px 12px; border-bottom: 1px solid rgba(0,0,0,0.05);
+    }
+    .settings-row:last-child { border-bottom: none; }
+    .settings-lbl { font-size: 11px; color: #1c1c1e; }
+    .settings-val { font-size: 11px; color: #8e8e93; }
+    .settings-input {
+      background: #f2f2f7; border: none; border-radius: 6px; padding: 3px 7px;
+      font-size: 11px; color: #1c1c1e; font-family: 'Inter', -apple-system, sans-serif;
+      width: 120px; outline: none;
+    }
+    .settings-input:focus { box-shadow: 0 0 0 2px rgba(0,122,255,0.3); }
+
+    /* Assignee picker button in settings */
+    .assignee-picker-btn {
+      display: flex; align-items: center; gap: 6px;
+      background: #f2f2f7; border: none; border-radius: 8px;
+      padding: 4px 10px 4px 6px; cursor: pointer;
+      font-family: 'Inter', -apple-system, sans-serif;
+      font-size: 11px; color: #1c1c1e; transition: background 0.15s;
+      max-width: 160px;
+    }
+    .assignee-picker-btn:hover { background: #e5e5ea; }
+    .assignee-avatar-sm {
+      width: 20px; height: 20px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 9px; font-weight: 600; flex-shrink: 0;
+    }
+    .assignee-picker-name {
+      flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      font-weight: 500;
+    }
+    .assignee-picker-chevron { color: #c7c7cc; font-size: 12px; flex-shrink: 0; }
+    .settings-save {
+      background: #007aff; color: white; border: none; border-radius: 9px;
+      padding: 7px 0; font-size: 11px; font-weight: 500; cursor: pointer; width: 100%;
+    }
+    .settings-save:hover { background: #0071f3; }
+
+    /* ══════════════════════════════
+       USER PICKER OVERLAY
+    ══════════════════════════════ */
+    .overlay {
+      position: absolute; inset: 0;
+      background: rgba(242,242,247,0.97);
+      backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+      display: flex; flex-direction: column;
+      opacity: 0; pointer-events: none; transition: opacity 0.2s;
+      z-index: 20; border-radius: 16px;
+    }
+    .overlay.visible { opacity: 1; pointer-events: all; }
+
+    /* User picker */
+    .user-picker-header {
+      padding: 14px 14px 8px;
+    }
+    .user-picker-title { font-size: 12px; font-weight: 600; color: #1c1c1e; }
+    .user-picker-sub { font-size: 10px; color: #aeaeb2; margin-top: 2px; }
+    .user-list { padding: 0 10px 10px; display: flex; flex-direction: column; gap: 6px; flex: 1; overflow-y: auto; }
+    .user-row {
+      display: flex; align-items: center; gap: 10px;
+      padding: 9px 12px; border-radius: 12px;
+      background: white; border: 1px solid rgba(0,0,0,0.07);
+      cursor: pointer; transition: all 0.15s;
+    }
+    .user-row:hover { background: #eef5ff; border-color: rgba(0,122,255,0.25); }
+    .user-row:active { transform: scale(0.98); }
+    .user-avatar {
+      width: 32px; height: 32px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 11px; font-weight: 600; flex-shrink: 0;
+    }
+    .user-name { font-size: 12px; font-weight: 500; color: #1c1c1e; }
+    .user-meta { font-size: 10px; color: #8e8e93; }
+    .user-chevron { margin-left: auto; color: #c7c7cc; font-size: 14px; }
+    .user-back {
+      background: none; border: none; cursor: pointer;
+      font-size: 11px; color: #007aff; font-weight: 500; padding: 0;
+    }
+
+    /* Manual overlay */
+    .overlay-title { font-size: 11px; font-weight: 600; color: #1c1c1e; letter-spacing: 0.02em; }
+    .overlay-inner { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 24px; flex: 1; }
+    .overlay-input {
+      width: 100%; background: white; border: 1px solid rgba(0,0,0,0.12);
+      color: #1c1c1e; font-family: 'Inter', -apple-system, sans-serif;
+      font-size: 13px; font-weight: 400; padding: 8px 12px; outline: none;
+      border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    }
+    .overlay-input:focus { border-color: rgba(0,122,255,0.5); }
+    .overlay-input::placeholder { color: #c7c7cc; }
+    .overlay-actions { display: flex; gap: 8px; width: 100%; }
+    .overlay-actions button {
+      flex: 1; height: 34px; border: none; cursor: pointer;
+      font-family: 'Inter', -apple-system, sans-serif;
+      font-size: 12px; font-weight: 500; border-radius: 10px;
+    }
+    .btn-confirm { background: #007aff; color: white; }
+    .btn-confirm:hover { background: #0071f3; }
+    .btn-cancel-ov { background: #e5e5ea; color: #636366; }
+    .btn-cancel-ov:hover { background: #d8d8de; }
+
+    /* Loading dots */
+    .loading-dots { display: flex; gap: 6px; align-items: center; }
+    .loading-dot {
+      width: 7px; height: 7px; border-radius: 50%; background: #007aff;
+      animation: dotpulse 1.2s infinite ease-in-out;
+    }
+    .loading-dot:nth-child(2) { animation-delay: 0.2s; }
+    .loading-dot:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes dotpulse {
+      0%,80%,100% { opacity:0.2; transform:scale(0.75); }
+      40%          { opacity:1;   transform:scale(1); }
+    }
+    .overlay-msg { font-size: 11px; font-weight: 400; color: #8e8e93; text-align: center; letter-spacing: 0.02em; }
+
+    /* ── Status bar ── */
+    .status {
+      height: 20px; background: #f2f2f7;
+      border-top: 1px solid rgba(0,0,0,0.05);
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 14px; flex-shrink: 0;
+    }
+    .status-text { font-size: 9px; font-weight: 400; color: #aeaeb2; letter-spacing: 0.03em; }
+    .status-text.ok   { color: #34c759; }
+    .status-text.err  { color: #ff3b30; }
+    .status-text.warn { color: #ff9500; }
+    .status-user { font-size: 9px; font-weight: 500; color: #c7c7cc; letter-spacing: 0.03em; }
+
+    /* ── Mini pill (body-level, position fixed) ── */
+    .mini-pill {
+      display: none;
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 0 14px;
+      background: rgba(28,28,30,0.92);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border-radius: 16px;
+      cursor: grab;
+      box-sizing: border-box;
+      z-index: 9999;
+    }
+    .mini-pill:active { cursor: grabbing; }
+    .mini-pill.visible { display: flex; }
+
+    .mini-dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: #34c759; flex-shrink: 0;
+      animation: minipulse 1.4s ease-in-out infinite;
+    }
+    @keyframes minipulse {
+      0%,100% { opacity: 1; box-shadow: 0 0 0 0 rgba(52,199,89,0.5); }
+      50%      { opacity: 0.7; box-shadow: 0 0 0 4px rgba(52,199,89,0); }
+    }
+
+    .mini-time {
+      font-size: 13px; font-weight: 500; color: #ffffff;
+      font-variant-numeric: tabular-nums; letter-spacing: -0.01em;
+      flex-shrink: 0;
+    }
+
+    .mini-task {
+      font-size: 10px; font-weight: 400; color: rgba(255,255,255,0.55);
+      flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      letter-spacing: 0.02em;
+      max-width: 120px;
+    }
+
+    .mini-actions {
+      display: flex; gap: 4px; align-items: center; flex-shrink: 0;
+    }
+
+    .mini-btn {
+      background: rgba(255,255,255,0.12);
+      border: none; cursor: pointer;
+      width: 28px; height: 28px;
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 12px; flex-shrink: 0; transition: background 0.15s, color 0.15s;
+      color: rgba(255,255,255,0.8);
+      padding: 0;
+    }
+    .mini-btn:hover { background: rgba(255,255,255,0.22); }
+    .mini-pause.paused { background: rgba(255,200,0,0.25); color: #ffd60a; }
+    .mini-stop:hover  { background: rgba(255,59,48,0.35); color: #ff3b30; }
+  </style>
+</head>
+<body>
+  <!-- Mini pill: body-level so it is never clipped by .widget -->
+  <div class="mini-pill" id="miniPill">
+    <div class="mini-dot" id="miniDot"></div>
+    <span class="mini-time" id="miniTime">00:00:00</span>
+    <span class="mini-task" id="miniTaskName"></span>
+    <div class="mini-actions">
+      <button class="mini-btn mini-pause" id="btnMiniPause">⏸</button>
+      <button class="mini-btn mini-stop" id="btnMiniStop">■</button>
+      <button class="mini-btn mini-expand" id="btnMiniExpand">↕</button>
+    </div>
+  </div>
+
+  <div class="widget" id="mainWidget">
+
+    <!-- Drag bar -->
+    <div class="drag-bar" id="dragBar">
+      <span class="drag-title">Everest Timer</span>
+      <div class="drag-controls">
+        <button id="btnMin" title="Minimize">─</button>
+        <button id="btnClose" title="Close">✕</button>
+      </div>
+    </div>
+
+    <!-- Tab bar -->
+    <div class="tab-bar">
+      <button class="tab-btn active" data-tab="timer">
+        <span class="tab-icon">⏱</span> Timer
+      </button>
+      <button class="tab-btn" data-tab="chrome">
+        <span class="tab-icon">⬡</span> Tabs
+      </button>
+      <button class="tab-btn" data-tab="stats">
+        <span class="tab-icon">◫</span> Stats
+      </button>
+      <button class="tab-btn" data-tab="settings">
+        <span class="tab-icon">⚙</span>
+      </button>
+    </div>
+
+    <!-- ══ TIMER TAB ══ -->
+    <div class="tab-panel active" id="tab-timer">
+      <!-- Queue strip -->
+      <div class="task-queue">
+        <span class="queue-label">Queue</span>
+        <div class="queue-dots" id="queueDots"></div>
+        <span class="queue-count" id="queueCount">—</span>
+      </div>
+
+      <!-- Task dropdown row -->
+      <div id="taskSelectorRow">
+        <select id="taskDropdown">
+          <option value="">— Select a task —</option>
+        </select>
+        <button id="btnRefreshTasks" title="Refresh tasks">↺</button>
+      </div>
+
+      <!-- Timer card -->
+      <div class="timer-display">
+        <div class="time" id="timeDisplay">00:00:00</div>
+        <div class="task-label" id="taskLabel">Loading tasks…</div>
+      </div>
+
+      <!-- Main controls -->
+      <div class="controls">
+        <button class="btn btn-start" id="btnStart" disabled>▶ Start</button>
+        <button class="btn btn-pause" id="btnPause">⏸ Pause</button>
+        <button class="btn btn-stop" id="btnStop">■ Stop</button>
+        <button class="btn btn-sync" id="btnSync" title="Sync to Notion">↑</button>
+      </div>
+
+      <!-- Break controls -->
+      <div class="break-controls">
+        <button class="btn-break" id="btnMorning">☀ Morning</button>
+        <button class="btn-break" id="btnLunch">🍱 Lunch</button>
+        <button class="btn-break" id="btnEvening">🌙 Evening</button>
+      </div>
+    </div>
+
+    <!-- ══ CHROME TABS TAB ══ -->
+    <div class="tab-panel" id="tab-chrome">
+      <div class="chrome-panel">
+        <div class="chrome-header">
+          <span class="chrome-title">Open Chrome Tabs</span>
+          <button class="chrome-refresh" id="btnRefreshChrome" title="Refresh">↺</button>
+        </div>
+        <div id="chromeTabsList">
+          <div class="chrome-empty">
+            No Chrome tabs detected.<br>
+            <button class="chrome-connect-btn" id="btnConnectChrome">Connect Chrome Extension</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ STATS TAB ══ -->
+    <div class="tab-panel" id="tab-stats">
+      <div class="stats-panel">
+        <div class="stats-header">
+          <span class="stats-title">Today's Log</span>
+          <span class="stats-today" id="statsTodayDate"></span>
+        </div>
+        <div class="stats-summary">
+          <div class="stats-card">
+            <div class="stats-card-val" id="statsTotalTime">0h 0m</div>
+            <div class="stats-card-lbl">Total tracked</div>
+          </div>
+          <div class="stats-card">
+            <div class="stats-card-val" id="statsTaskCount">0</div>
+            <div class="stats-card-lbl">Tasks done</div>
+          </div>
+        </div>
+        <div class="stats-history" id="statsHistory">
+          <div class="stats-empty">No completed tasks yet.<br>Start tracking to see history here.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ SETTINGS TAB ══ -->
+    <div class="tab-panel" id="tab-settings">
+      <div class="settings-panel">
+        <div class="settings-group">
+          <div class="settings-row">
+            <span class="settings-lbl">Assignee</span>
+            <button class="assignee-picker-btn" id="btnPickAssignee">
+              <div class="assignee-avatar-sm" id="settingAssigneeAvatar"></div>
+              <span class="assignee-picker-name" id="settingAssigneeName">—</span>
+              <span class="assignee-picker-chevron">›</span>
+            </button>
+            <!-- hidden input kept for save-settings logic -->
+            <input type="hidden" id="settingAssignee" />
+          </div>
+          <div class="settings-row">
+            <span class="settings-lbl">Status filter</span>
+            <input class="settings-input" id="settingStatus" type="text" />
+          </div>
+          <div class="settings-row">
+            <span class="settings-lbl">DB ID</span>
+            <input class="settings-input" id="settingDbId" type="text" style="font-size:9px;" />
+          </div>
+        </div>
+        <div class="settings-group">
+          <div class="settings-row">
+            <span class="settings-lbl">Task name field</span>
+            <input class="settings-input" id="settingFieldTask" type="text" />
+          </div>
+          <div class="settings-row">
+            <span class="settings-lbl">Assignee field</span>
+            <input class="settings-input" id="settingFieldAssignee" type="text" />
+          </div>
+          <div class="settings-row">
+            <span class="settings-lbl">Status field</span>
+            <input class="settings-input" id="settingFieldStatus" type="text" />
+          </div>
+          <div class="settings-row">
+            <span class="settings-lbl">Start Time field</span>
+            <input class="settings-input" id="settingFieldStart" type="text" />
+          </div>
+          <div class="settings-row">
+            <span class="settings-lbl">End Time field</span>
+            <input class="settings-input" id="settingFieldEnd" type="text" />
+          </div>
+          <div class="settings-row">
+            <span class="settings-lbl">Duration field</span>
+            <input class="settings-input" id="settingFieldDuration" type="text" />
+          </div>
+        </div>
+        <button class="settings-save" id="btnSaveSettings">Save Settings</button>
+      </div>
+    </div>
+
+    <!-- Status bar -->
+    <div class="status">
+      <span class="status-text" id="statusText">Fetching tasks…</span>
+      <span class="status-user" id="statusUser">—</span>
+    </div>
+
+
+
+    <!-- ══ USER PICKER OVERLAY ══ -->
+    <div class="overlay visible" id="userPickerOverlay">
+      <div class="drag-bar" style="cursor:default; border-bottom: 1px solid rgba(0,0,0,0.06);">
+        <span class="drag-title" id="userPickerTitle">Who's tracking today?</span>
+        <button class="user-back" id="btnUserPickerBack" style="display:none;">✕ Cancel</button>
+      </div>
+      <div class="user-picker-header">
+        <div class="user-picker-sub" id="userPickerSub">Fetching users from Notion…</div>
+      </div>
+      <div class="user-list" id="userList">
+        <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;flex:1;gap:10px;padding:30px 0;">
+          <div class="loading-dots">
+            <div class="loading-dot"></div>
+            <div class="loading-dot"></div>
+            <div class="loading-dot"></div>
+          </div>
+          <div class="overlay-msg">Connecting to Notion…</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ LOADING OVERLAY ══ -->
+    <div class="overlay" id="loadingOverlay">
+      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;flex:1;gap:12px;padding:24px;">
+        <div class="loading-dots">
+          <div class="loading-dot"></div>
+          <div class="loading-dot"></div>
+          <div class="loading-dot"></div>
+        </div>
+        <div class="overlay-msg" id="loadingMsg">Loading…</div>
+      </div>
+    </div>
+
+    <!-- ══ MANUAL TASK OVERLAY ══ -->
+    <div class="overlay" id="manualOverlay">
+      <div class="overlay-inner">
+        <span class="overlay-title">Enter task name</span>
+        <input class="overlay-input" id="manualInput" type="text"
+          placeholder="e.g. Corporate Booking Testing" maxlength="80" />
+        <div class="overlay-actions">
+          <button class="btn-cancel-ov" id="btnCancelManual">Cancel</button>
+          <button class="btn-confirm" id="btnConfirmManual">Start Timer</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+  <script src="renderer.js"></script>
+</body>
+</html>

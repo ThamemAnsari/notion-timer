@@ -1,0 +1,32 @@
+{
+  "name": "everest-timer",
+  "version": "1.0.0",
+  "description": "Floating timer widget for Team Everest — syncs to Notion",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build-mac": "electron-builder --mac",
+    "build-linux": "electron-builder --linux"
+  },
+  "build": {
+    "appId": "ngo.teameverest.timer",
+    "productName": "Everest Timer",
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": "dmg"
+    },
+    "linux": {
+      "target": "AppImage"
+    },
+    "files": [
+      "main.js",
+      "renderer.js",
+      "index.html",
+      "config.json"
+    ]
+  },
+  "devDependencies": {
+    "electron": "^29.0.0",
+    "electron-builder": "^24.0.0"
+  }
+}
