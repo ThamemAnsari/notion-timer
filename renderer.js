@@ -1,14 +1,17 @@
 const { ipcRenderer } = require('electron');
-const fs = require('fs');
+const fs   = require('fs');
 const path = require('path');
+
+// Load .env from app root (gitignored — safe to put token here)
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 
 let config = {
-  notionToken: '',               // set via Settings — never hardcode here
-  notionDatabaseId: '3807d2c4a614804fb87fd0d683a2c38f',
-  assigneeName: '',           // set by user picker
+  notionToken:      process.env.NOTION_TOKEN       || '',   // from .env
+  notionDatabaseId: process.env.NOTION_DATABASE_ID || '3807d2c4a614804fb87fd0d683a2c38f',
+  assigneeName: '',
   statusFilter: 'Not started',
   fields: {
     taskName: 'Task name',
