@@ -805,9 +805,12 @@ async function loadTasks() {
     taskQueue = tasks;
     populateDropdown(tasks);
     renderQueue();
-    taskLabel.textContent = 'Select a task above ↑';
-    taskLabel.className = 'task-label';
-    btnStart.disabled = true;
+    // Only reset label/disable if no task was auto-selected by populateDropdown
+    if (!currentTask) {
+      taskLabel.textContent = 'Select a task above ↑';
+      taskLabel.className = 'task-label';
+      btnStart.disabled = true;
+    }
     setStatus(`${tasks.length} task${tasks.length > 1 ? 's' : ''} loaded`, 'ok');
 
   } catch (e) {
