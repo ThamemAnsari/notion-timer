@@ -2,414 +2,381 @@ const { ipcRenderer } = require('electron');
 const fs   = require('fs');
 const path = require('path');
 
-// Load .env from app root (gitignored — safe to put token here)
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 
 let config = {
-  notionToken:      process.env.NOTION_TOKEN       || '',   // from .env
-  notionDatabaseId: process.env.NOTION_DATABASE_ID || '3807d2c4a614804fb87fd0d683a2c38f',
+  airtableToken:           process.env.AIRTABLE_TOKEN       || '',
+  airtableBaseId:          process.env.AIRTABLE_BASE_ID     || 'appb8bp8Oax0sM4NC',
+  airtableTableId:         process.env.AIRTABLE_TABLE_ID    || 'tbl4e3rdZ7T4ARVLO',
+  airtableEmployeeTableId: 'tblRJBTklGq8tph6o',
   assigneeName: '',
-  statusFilter: 'Not started',
+  statusFilter: 'Yet to Start',
   fields: {
-    taskName: 'Task name',
-    assignee: 'Assignee',
-    status: 'Status',
-    startTime: 'Start Time',
-    endTime: 'End Time',
-    duration: 'Actual Time Spend',
+    taskName:  'Task',
+    assignee:  'Assignee',
+    status:    'Task Status',
+    startTime: 'Planned Start Date',
+    endTime:   'Planned End Date',
+    duration:  'Actual Time Spend',
   }
 };
 
 if (fs.existsSync(CONFIG_PATH)) {
   try {
     const saved = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
-    config = { ...config, ...saved, fields: { ...config.fields, ...(saved.fields || {}) } };
-  } catch (e) { /* ignore */ }
+    config = {
+      ...config, ...saved,
+      fields: { ...config.fields, ...(saved.fields || {}) },
+      airtableEmployeeTableId: saved.airtableEmployeeTableId || 'tblRJBTklGq8tph6o',
+    };
+  } catch(e) {}
 }
 
 // ─── STATE ───────────────────────────────────────────────────────────────────
-let timerInterval  = null;
-let startTime      = null;
-let elapsed        = 0;
-let isPaused       = false;
-let currentBreak   = null;
-let breakStart     = null;
+let timerInterval = null, startTime = null, elapsed = 0;
+let isPaused = false, currentBreak = null, breakStart = null;
+let taskQueue = [], currentTask = null, completedTasks = [], lastEntry = null, taskStartWall = null;
+let selectedUser = null;
 
-let taskQueue      = [];
-let currentTask    = null;
-let completedTasks = [];
-let lastEntry      = null;
-let taskStartWall  = null;
+// ─── EMPLOYEE CACHE ───────────────────────────────────────────────────────────
+const recordNameCache = {};
+let employeeMap = {};
 
-let selectedUser   = null;   // { name, taskCount }
+async function loadEmployeeMap() {
+  employeeMap = {};
+  let offset = null, total = 0;
+  try {
+    do {
+      let url = `https://api.airtable.com/v0/${config.airtableBaseId}/${encodeURIComponent(config.airtableEmployeeTableId)}?pageSize=100&fields[]=Unique%20Name&fields[]=Full%20Name&fields[]=First%20Name&fields[]=Name`;
+      if (offset) url += `&offset=${encodeURIComponent(offset)}`;
+      const data = await airtableRequest(url);
+      (data.records || []).forEach(rec => {
+        const name = rec.fields?.['Unique Name'] || rec.fields?.['Full Name'] || rec.fields?.['First Name'] || rec.fields?.['Name'];
+        if (name) { employeeMap[rec.id] = name; recordNameCache[rec.id] = name; total++; }
+      });
+      offset = data.offset || null;
+    } while (offset);
+    console.log(`[loadEmployeeMap] ✓ ${total} employees`);
+  } catch(err) { console.error('[loadEmployeeMap]', err.message); }
+}
+
+async function resolveRecordIdsBatch(recordIds) {
+  const unresolved = recordIds.filter(id => !employeeMap[id]);
+  if (!unresolved.length) return;
+  await Promise.all(unresolved.map(async id => {
+    try {
+      const url = `https://api.airtable.com/v0/${config.airtableBaseId}/${encodeURIComponent(config.airtableEmployeeTableId)}/${id}`;
+      const data = await airtableRequest(url);
+      const name = data.fields?.['Unique Name'] || data.fields?.['Full Name'] || data.fields?.['First Name'] || data.fields?.['Name'];
+      if (name) { employeeMap[id] = name; recordNameCache[id] = name; }
+    } catch(e) {}
+  }));
+}
+
+function resolveEmployeeName(id) { return employeeMap[id] || recordNameCache[id] || id; }
+
+function resolveAssigneeField(raw) {
+  if (!raw) return '';
+  if (Array.isArray(raw)) return raw.map(v => typeof v === 'object' ? (v.name || resolveEmployeeName(v.id)) : resolveEmployeeName(String(v))).filter(Boolean).join(', ');
+  if (typeof raw === 'string') return (raw.startsWith('rec') && raw.length > 10) ? resolveEmployeeName(raw) : raw;
+  return String(raw);
+}
 
 // ─── DOM ─────────────────────────────────────────────────────────────────────
-const timeDisplay        = document.getElementById('timeDisplay');
-const taskLabel          = document.getElementById('taskLabel');
-const btnStart           = document.getElementById('btnStart');
-const btnPause           = document.getElementById('btnPause');
-const btnStop            = document.getElementById('btnStop');
-const btnSync            = document.getElementById('btnSync');
-const statusText         = document.getElementById('statusText');
-const statusUser         = document.getElementById('statusUser');
-const queueDots          = document.getElementById('queueDots');
-const queueCount         = document.getElementById('queueCount');
-const taskDropdown       = document.getElementById('taskDropdown');
-const btnRefreshTasks    = document.getElementById('btnRefreshTasks');
+// Timer
+const clock             = document.getElementById('clock');
+const chipDot           = document.getElementById('chipDot');
+const chipName          = document.getElementById('chipName');
+const btnStart          = document.getElementById('btnStart');
+const btnPause          = document.getElementById('btnPause');
+const btnStop           = document.getElementById('btnStop');
+const btnSync           = document.getElementById('btnSync');
+const statusText        = document.getElementById('statusText');
+const statusUser        = document.getElementById('statusUser');
+const queuePips         = document.getElementById('queuePips');
+const queueBadge        = document.getElementById('queueBadge');
+const taskDropdown      = document.getElementById('taskDropdown');
+const btnRefreshTasks   = document.getElementById('btnRefreshTasks');
+const progFill          = document.getElementById('progFill');
 
-const loadingOverlay     = document.getElementById('loadingOverlay');
-const loadingMsg         = document.getElementById('loadingMsg');
-const manualOverlay      = document.getElementById('manualOverlay');
-const manualInput        = document.getElementById('manualInput');
-const btnConfirmManual   = document.getElementById('btnConfirmManual');
-const btnCancelManual    = document.getElementById('btnCancelManual');
-const userPickerOverlay  = document.getElementById('userPickerOverlay');
-const userList           = document.getElementById('userList');
+// Overlays (inside .main)
+const loadingOverlay    = document.getElementById('loadingOverlay');
+const loadingMsg        = document.getElementById('loadingMsg');
+const manualOverlay     = document.getElementById('manualOverlay');
+const manualInput       = document.getElementById('manualInput');
+const btnConfirmManual  = document.getElementById('btnConfirmManual');
+const btnCancelManual   = document.getElementById('btnCancelManual');
 
-const btnMorning         = document.getElementById('btnMorning');
-const btnLunch           = document.getElementById('btnLunch');
-const btnEvening         = document.getElementById('btnEvening');
+// User picker modal (full-widget)
+const userPickerModal   = document.getElementById('userPickerModal');
+const upTitle           = document.getElementById('upTitle');
+const upSub             = document.getElementById('upSub');
+const upBody            = document.getElementById('upBody');
+const upSearchWrap      = document.getElementById('upSearchWrap');
+const upSearch          = document.getElementById('upSearch');
+const btnUpCancel       = document.getElementById('btnUpCancel');
 
-// Stats DOM
-const statsTodayDate     = document.getElementById('statsTodayDate');
-const statsTotalTime     = document.getElementById('statsTotalTime');
-const statsTaskCount     = document.getElementById('statsTaskCount');
-const statsHistory       = document.getElementById('statsHistory');
+// Break buttons
+const btnMorning        = document.getElementById('btnMorning');
+const btnLunch          = document.getElementById('btnLunch');
+const btnEvening        = document.getElementById('btnEvening');
 
-// Settings DOM
-const settingAssignee    = document.getElementById('settingAssignee');
-const settingStatus      = document.getElementById('settingStatus');
-const settingDbId        = document.getElementById('settingDbId');
-const settingFieldTask   = document.getElementById('settingFieldTask');
+// Stats
+const statsTodayDate    = document.getElementById('statsTodayDate');
+const statsTotalTime    = document.getElementById('statsTotalTime');
+const statsTaskCount    = document.getElementById('statsTaskCount');
+const statsHistory      = document.getElementById('statsHistory');
+
+// Settings
+const settingAssignee   = document.getElementById('settingAssignee');
+const settingStatus     = document.getElementById('settingStatus');
+const settingBaseId     = document.getElementById('settingBaseId');
+const settingFieldTask  = document.getElementById('settingFieldTask');
 const settingFieldAssignee = document.getElementById('settingFieldAssignee');
-const settingFieldStatus = document.getElementById('settingFieldStatus');
-const settingFieldStart  = document.getElementById('settingFieldStart');
-const settingFieldEnd    = document.getElementById('settingFieldEnd');
+const settingFieldStatus   = document.getElementById('settingFieldStatus');
+const settingFieldStart    = document.getElementById('settingFieldStart');
+const settingFieldEnd      = document.getElementById('settingFieldEnd');
 const settingFieldDuration = document.getElementById('settingFieldDuration');
-const btnSaveSettings    = document.getElementById('btnSaveSettings');
+const btnSaveSettings      = document.getElementById('btnSaveSettings');
+const mainWidget           = document.getElementById('mainWidget');
 
-// Mini-pill DOM
-const miniPill           = document.getElementById('miniPill');
-const miniTimeSp         = document.getElementById('miniTime');
-const miniTaskSp         = document.getElementById('miniTaskName');
-const btnMiniExpand      = document.getElementById('btnMiniExpand');
-const btnMiniPause       = document.getElementById('btnMiniPause');
-const btnMiniStop        = document.getElementById('btnMiniStop');
-const mainWidget         = document.getElementById('mainWidget');
+// ─── SIDEBAR COLLAPSE ────────────────────────────────────────────────────────
+const sidebar = document.getElementById('sidebar');
+document.getElementById('sidebarToggle').addEventListener('click', () => sidebar.classList.toggle('collapsed'));
 
-let isMiniMode = false;
-
-// ─── MINI MODE ─────────────────────────────────────────────────────────────────────────
-function enterMiniMode(taskName) {
-  isMiniMode = true;
-  miniTaskSp.textContent = taskName;
-  miniTimeSp.textContent = timeDisplay.textContent;
-  btnMiniPause.textContent = '\u23f8';
-  btnMiniPause.classList.remove('paused');
-  miniPill.classList.add('visible');
-  mainWidget.style.display = 'none';   // hide entire widget
-  ipcRenderer.send('show-mini');
-}
-
-function exitMiniMode() {
-  isMiniMode = false;
-  miniPill.classList.remove('visible');
-  mainWidget.style.display = '';       // restore widget
-  ipcRenderer.send('show-full');
-}
-
-// Drag the mini-pill (reuse same move-window IPC)
-let miniDragging = false, miniLastX, miniLastY;
-miniPill.addEventListener('mousedown', (e) => {
-  // Don't drag if clicking action buttons
-  if (e.target.closest('.mini-actions')) return;
-  miniDragging = true; miniLastX = e.screenX; miniLastY = e.screenY;
-});
-document.addEventListener('mousemove', (e) => {
-  if (!miniDragging) return;
-  ipcRenderer.send('move-window', { dx: e.screenX - miniLastX, dy: e.screenY - miniLastY });
-  miniLastX = e.screenX; miniLastY = e.screenY;
-});
-document.addEventListener('mouseup', () => { miniDragging = false; });
-
-btnMiniExpand.addEventListener('click', () => exitMiniMode());
-
-// Mini pause — toggle pause/resume
-btnMiniPause.addEventListener('click', () => {
-  if (isPaused) {
-    resumeTimer();
-    btnMiniPause.textContent = '\u23f8';   // ⏸
-    btnMiniPause.classList.remove('paused');
-    btnMiniPause.setAttribute('data-tip', 'Pause');
-  } else {
-    pauseTimer();
-    btnMiniPause.textContent = '\u25b6';   // ▶
-    btnMiniPause.classList.add('paused');
-    btnMiniPause.setAttribute('data-tip', 'Resume');
-  }
-});
-
-// Mini stop — stop timer and exit mini mode
-btnMiniStop.addEventListener('click', () => {
-  stopTimer();   // stopTimer already calls exitMiniMode()
-});
-
-// ─── TAB SWITCHING ───────────────────────────────────────────────────────────
-document.querySelectorAll('.tab-btn').forEach(btn => {
+// ─── SIDEBAR NAV ─────────────────────────────────────────────────────────────
+const titles = { timer: 'Timer', stats: 'Stats', chrome: 'Tabs', settings: 'Settings' };
+document.querySelectorAll('.sb-item[data-tab]').forEach(btn => {
   btn.addEventListener('click', () => {
     const tab = btn.dataset.tab;
-    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.sb-item').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
     btn.classList.add('active');
-    document.getElementById(`tab-${tab}`).classList.add('active');
-
-    // Tell main process to resize the window for this tab
+    document.getElementById(`panel-${tab}`)?.classList.add('active');
+    document.getElementById('topTitle').textContent = titles[tab] || tab;
     ipcRenderer.send('resize-for-tab', tab);
-
     if (tab === 'stats') renderStats();
     if (tab === 'settings') populateSettings();
   });
 });
 
-// ─── WINDOW DRAG ─────────────────────────────────────────────────────────────
+// ─── WINDOW CONTROLS ─────────────────────────────────────────────────────────
 let dragging = false, lastX, lastY;
-document.getElementById('dragBar').addEventListener('mousedown', (e) => {
-  dragging = true; lastX = e.screenX; lastY = e.screenY;
+['dragBar','topDragBar'].forEach(id => {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.addEventListener('mousedown', e => { dragging = true; lastX = e.screenX; lastY = e.screenY; });
 });
-document.addEventListener('mousemove', (e) => {
+document.addEventListener('mousemove', e => {
   if (!dragging) return;
   ipcRenderer.send('move-window', { dx: e.screenX - lastX, dy: e.screenY - lastY });
   lastX = e.screenX; lastY = e.screenY;
 });
 document.addEventListener('mouseup', () => { dragging = false; });
 document.getElementById('btnClose').addEventListener('click', () => ipcRenderer.send('close-app'));
-document.getElementById('btnMin').addEventListener('click', () => ipcRenderer.send('minimize-app'));
+document.getElementById('btnMin').addEventListener('click',   () => ipcRenderer.send('minimize-app'));
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
-function formatTime(ms) {
-  const totalSec = Math.floor(ms / 1000);
-  const h = Math.floor(totalSec / 3600);
-  const m = Math.floor((totalSec % 3600) / 60);
-  const s = totalSec % 60;
-  return [h, m, s].map(v => String(v).padStart(2, '0')).join(':');
+function fmtTime(ms) {
+  const s = Math.floor(ms/1000), h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
+  return [h, m, s%60].map(v => String(v).padStart(2,'0')).join(':');
 }
-
-function formatDuration(ms) {
-  const totalMins = Math.floor(ms / 60000);
-  const h = Math.floor(totalMins / 60);
-  const m = totalMins % 60;
+function fmtDur(ms) {
+  const t = Math.floor(ms/60000), h = Math.floor(t/60), m = t%60;
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
-
-function setStatus(msg, type = '') {
+function setStatus(msg, type='') {
   statusText.textContent = msg;
-  statusText.className = `status-text ${type}`;
+  statusText.className = `st ${type}`;
 }
-
-function setLoading(msg, show = true) {
+function setLoading(msg, show=true) {
   loadingMsg.textContent = msg;
-  if (show) loadingOverlay.classList.add('visible');
-  else loadingOverlay.classList.remove('visible');
+  loadingOverlay.classList.toggle('open', show);
+}
+function initials(name) { return name.split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2); }
+function avatarColor(name) {
+  const p = [
+    {bg:'#b5d4f4',color:'#0c447c'},{bg:'#9fe1cb',color:'#085041'},
+    {bg:'#f5c4b3',color:'#712b13'},{bg:'#f4c0d1',color:'#72243e'},
+    {bg:'#c0dd97',color:'#27500a'},{bg:'#fac775',color:'#633806'},
+  ];
+  let h=0; for (const c of name) h=(h*31+c.charCodeAt(0))&0xffff;
+  return p[h%p.length];
 }
 
-// ─── NOTION API ──────────────────────────────────────────────────────────────
-async function notionRequest(endpoint, method = 'GET', body = null) {
+// ─── AIRTABLE ────────────────────────────────────────────────────────────────
+function atBase() { return `https://api.airtable.com/v0/${config.airtableBaseId}/${encodeURIComponent(config.airtableTableId)}`; }
+
+async function airtableRequest(url, method='GET', body=null) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 12000);
   const opts = {
-    method,
-    headers: {
-      'Authorization': `Bearer ${config.notionToken}`,
-      'Notion-Version': '2022-06-28',
-      'Content-Type': 'application/json',
-    },
+    method, signal: ctrl.signal,
+    headers: { 'Authorization': `Bearer ${config.airtableToken}`, 'Content-Type': 'application/json' },
   };
   if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(`https://api.notion.com/v1${endpoint}`, opts);
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.message || `Notion error ${res.status}`);
-  return data;
+  try {
+    const res = await fetch(url, opts);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error?.message || data.error || `Airtable ${res.status}`);
+    return data;
+  } catch(e) {
+    if (e.name === 'AbortError') throw new Error('Request timed out (12s) — check token & base ID');
+    throw e;
+  } finally { clearTimeout(t); }
 }
 
-function extractText(prop) {
-  if (!prop) return '';
-  if (prop.type === 'title')     return prop.title.map(t => t.plain_text).join('');
-  if (prop.type === 'rich_text') return prop.rich_text.map(t => t.plain_text).join('');
-  if (prop.type === 'select')    return prop.select?.name || '';
-  if (prop.type === 'status')    return prop.status?.name || '';
-  if (prop.type === 'people')    return prop.people?.map(p => p.name).join(', ') || '';
-  return '';
+async function atFetchAll(formula) {
+  let records=[], offset=null;
+  do {
+    let url = `${atBase()}?filterByFormula=${encodeURIComponent(formula)}&pageSize=100`;
+    if (offset) url += `&offset=${encodeURIComponent(offset)}`;
+    const data = await airtableRequest(url);
+    records = records.concat(data.records || []);
+    offset = data.offset || null;
+  } while (offset);
+  return records;
+}
+
+function extractField(rec, field) {
+  if (!rec?.fields) return '';
+  const v = rec.fields[field];
+  if (v == null) return '';
+  if (Array.isArray(v)) return v.join(', ');
+  return String(v);
 }
 
 // ─── USER PICKER ─────────────────────────────────────────────────────────────
 async function fetchAllAssignees() {
-  // Query all "Not started" tasks to extract unique assignees
-  const queryBody = {
-    page_size: 100,
-    filter: {
-      property: config.fields.status,
-      status: { equals: config.statusFilter || 'Not started' }
-    },
-  };
-  const data = await notionRequest(
-    `/databases/${config.notionDatabaseId}/query`, 'POST', queryBody
-  );
+  const formula = `{${config.fields.status}} = "${config.statusFilter || 'Yet to Start'}"`;
+  const records = await atFetchAll(formula);
+  if (!records.length) return [];
 
-  // Count tasks per assignee
-  const assigneeMap = {};
-  (data.results || []).forEach(page => {
-    const props = page.properties;
-    const assigneeRaw = props[config.fields.assignee];
-    if (!assigneeRaw || assigneeRaw.type !== 'people') return;
-    (assigneeRaw.people || []).forEach(person => {
-      if (!person.name) return;
-      if (!assigneeMap[person.name]) assigneeMap[person.name] = 0;
-      assigneeMap[person.name]++;
+  const allIds = new Set();
+  records.forEach(rec => {
+    const raw = rec.fields[config.fields.assignee];
+    if (!raw) return;
+    (Array.isArray(raw)?raw:[raw]).forEach(v => {
+      const s = typeof v==='object'?v?.id:String(v);
+      if (s?.startsWith('rec')&&s.length>10) allIds.add(s);
     });
   });
+  if (!Object.keys(employeeMap).length && allIds.size) await resolveRecordIdsBatch([...allIds]);
 
-  return Object.entries(assigneeMap)
-    .map(([name, count]) => ({ name, taskCount: count }))
-    .sort((a, b) => a.name.localeCompare(b.name));
+  const map = {};
+  records.forEach(rec => {
+    const raw = rec.fields[config.fields.assignee];
+    if (!raw) return;
+    (Array.isArray(raw)?raw:[raw]).forEach(v => {
+      let name;
+      if (typeof v==='object'&&v!==null) name = v.name||resolveEmployeeName(v.id);
+      else { const s=String(v).trim(); name=(s.startsWith('rec')&&s.length>10)?resolveEmployeeName(s):s; }
+      if (name) map[name]=(map[name]||0)+1;
+    });
+  });
+  return Object.entries(map).map(([name,taskCount])=>({name,taskCount})).sort((a,b)=>a.name.localeCompare(b.name));
 }
 
-// Generate a consistent avatar colour per name
-function avatarColor(name) {
-  const palettes = [
-    { bg: '#b5d4f4', color: '#0c447c' },
-    { bg: '#9fe1cb', color: '#085041' },
-    { bg: '#f5c4b3', color: '#712b13' },
-    { bg: '#f4c0d1', color: '#72243e' },
-    { bg: '#c0dd97', color: '#27500a' },
-    { bg: '#fac775', color: '#633806' },
-  ];
-  let hash = 0;
-  for (const ch of name) hash = (hash * 31 + ch.charCodeAt(0)) & 0xffff;
-  return palettes[hash % palettes.length];
-}
-
-function initials(name) {
-  return name.split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2);
-}
-
-async function showUserPicker(fromSettings = false) {
-  const btnBack = document.getElementById('btnUserPickerBack');
-  const titleEl = document.getElementById('userPickerTitle');
-  const subEl   = document.getElementById('userPickerSub');
-
-  // Adjust header for context
+async function showUserPicker(fromSettings=false) {
   if (fromSettings) {
-    titleEl.textContent = 'Switch Assignee';
-    subEl.textContent = 'Pick a different user';
-    btnBack.style.display = 'block';
-    btnBack.onclick = () => {
-      userPickerOverlay.classList.remove('visible');
-      // return to settings tab
-      document.querySelector('[data-tab="settings"]').click();
-    };
+    upTitle.textContent = 'Switch Assignee';
+    upSub.textContent = 'Pick a different team member';
+    btnUpCancel.classList.add('show');
+    btnUpCancel.onclick = () => userPickerModal.classList.remove('open');
   } else {
-    titleEl.textContent = "Who's tracking today?";
-    subEl.textContent = 'Fetching users from Notion…';
-    btnBack.style.display = 'none';
+    upTitle.textContent = "Who's tracking today?";
+    upSub.textContent = 'Connecting to Airtable…';
+    btnUpCancel.classList.remove('show');
   }
 
-  userPickerOverlay.classList.add('visible');
-
-  // Show loading state
-  userList.innerHTML = `
-    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;flex:1;gap:10px;padding:30px 0;">
-      <div class="loading-dots">
-        <div class="loading-dot"></div><div class="loading-dot"></div><div class="loading-dot"></div>
-      </div>
-      <div class="overlay-msg">Connecting to Notion…</div>
-    </div>`;
+  userPickerModal.classList.add('open');
+  upSearchWrap.style.display = 'none';
+  upBody.innerHTML = `<div class="up-loader"><div class="dots"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div><div class="up-loader-msg">Loading employees from Airtable…</div></div>`;
 
   try {
+    if (!config.airtableToken) {
+      upBody.innerHTML = `<div class="up-loader"><div class="up-loader-msg" style="color:#dc2626;text-align:center;">⚠ No AIRTABLE_TOKEN in .env<br><span style="color:#9898b0;font-size:9px;display:block;margin-top:4px;">Add it and restart the app</span></div></div>`;
+      return;
+    }
+    try { await loadEmployeeMap(); } catch(e) {}
     const assignees = await fetchAllAssignees();
 
-    if (assignees.length === 0) {
-      userList.innerHTML = `<div class="overlay-msg" style="padding:30px 0;text-align:center;">
-        No assignees found in database.<br>Check your Notion token &amp; filters in Settings.
-      </div>`;
+    if (!assignees.length) {
+      upBody.innerHTML = `<div class="up-loader"><div class="up-loader-msg" style="text-align:center;">No assignees found.<br><span style="color:#9898b0;font-size:9px;display:block;margin-top:4px;">Status filter: "${config.statusFilter}"<br>Check DevTools console for details.</span></div></div>`;
       return;
     }
 
-    // If config already has an assigneeName saved (and not coming from settings), auto-pick if found
     if (!fromSettings && config.assigneeName) {
-      const match = assignees.find(a =>
-        a.name.toLowerCase() === config.assigneeName.toLowerCase()
-      );
-      if (match) {
-        onUserSelected(match, false);
-        return;
-      }
+      const match = assignees.find(a => a.name.toLowerCase() === config.assigneeName.toLowerCase());
+      if (match) { onUserSelected(match, false); return; }
     }
 
-    userList.innerHTML = '';
-    assignees.forEach(user => {
-      const pal = avatarColor(user.name);
-      const row = document.createElement('div');
-      row.className = 'user-row';
-      // highlight currently selected user
-      if (config.assigneeName && user.name.toLowerCase() === config.assigneeName.toLowerCase()) {
-        row.style.borderColor = 'rgba(0,122,255,0.35)';
-        row.style.background = '#eef5ff';
-      }
-      row.innerHTML = `
-        <div class="user-avatar" style="background:${pal.bg};color:${pal.color};">${initials(user.name)}</div>
-        <div>
-          <div class="user-name">${user.name}</div>
-          <div class="user-meta">${user.taskCount} task${user.taskCount !== 1 ? 's' : ''} waiting</div>
-        </div>
-        <span class="user-chevron">›</span>
-      `;
-      row.addEventListener('click', () => onUserSelected(user, fromSettings));
-      userList.appendChild(row);
-    });
+    upSub.textContent = `${assignees.length} team members`;
+    upSearchWrap.style.display = 'block';
 
-  } catch (e) {
-    userList.innerHTML = `<div class="overlay-msg" style="padding:30px 0;text-align:center;color:#ff3b30;">
-      Error: ${e.message}
-    </div>`;
+    function renderList(list) {
+      upBody.innerHTML = '';
+      const ul = document.createElement('div');
+      ul.className = 'up-list';
+      if (!list.length) { ul.innerHTML = '<div class="empty-msg">No matches found.</div>'; }
+      list.forEach(user => {
+        const pal = avatarColor(user.name);
+        const row = document.createElement('div');
+        row.className = 'up-row' + (config.assigneeName && user.name.toLowerCase()===config.assigneeName.toLowerCase()?' sel':'');
+        row.innerHTML = `
+          <div class="up-av" style="background:${pal.bg};color:${pal.color};">${initials(user.name)}</div>
+          <div>
+            <div class="up-name">${user.name}</div>
+            <div class="up-count">${user.taskCount} task${user.taskCount!==1?'s':''} waiting</div>
+          </div>
+          <span class="up-chev">›</span>`;
+        row.addEventListener('click', () => onUserSelected(user, fromSettings));
+        ul.appendChild(row);
+      });
+      upBody.appendChild(ul);
+    }
+    renderList(assignees);
+    upSearch.value = '';
+    upSearch.oninput = () => {
+      const q = upSearch.value.toLowerCase().trim();
+      renderList(q ? assignees.filter(a=>a.name.toLowerCase().includes(q)) : assignees);
+    };
+
+  } catch(e) {
+    upBody.innerHTML = `<div class="up-loader"><div class="up-loader-msg" style="color:#dc2626;">Error: ${e.message}</div></div>`;
   }
 }
 
-function onUserSelected(user, fromSettings = false) {
+function onUserSelected(user, fromSettings=false) {
   selectedUser = user;
   config.assigneeName = user.name;
+
+  // Update sidebar avatar + name
+  const sbAv = document.getElementById('sbAvatar');
+  const sbUname = document.getElementById('sbUname');
+  if (sbAv) { sbAv.textContent = initials(user.name); const p=avatarColor(user.name); sbAv.style.background=p.bg; sbAv.style.color=p.color; }
+  if (sbUname) sbUname.textContent = user.name;
   statusUser.textContent = user.name;
 
-  // Save selection
-  try {
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
-  } catch (e) { /* ignore */ }
-
-  userPickerOverlay.classList.remove('visible');
+  try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2)); } catch(e) {}
+  userPickerModal.classList.remove('open');
 
   if (fromSettings) {
-    // Update the assignee button in settings and go back to settings tab
     updateAssigneeBtn(user.name);
-    document.querySelector('[data-tab="settings"]').click();
-    setStatus(`Assignee changed to ${user.name}`, 'ok');
-    loadTasks();
-  } else {
-    loadTasks();
+    document.querySelector('[data-tab="settings"]')?.click();
+    setStatus(`Assignee → ${user.name}`, 'ok');
   }
+  loadTasks();
 }
 
-// Update the visual assignee picker button in Settings
 function updateAssigneeBtn(name) {
   const nameEl   = document.getElementById('settingAssigneeName');
   const avatarEl = document.getElementById('settingAssigneeAvatar');
   const hiddenEl = document.getElementById('settingAssignee');
-  if (!name) {
-    nameEl.textContent = '—';
-    avatarEl.textContent = '';
-    avatarEl.style.background = '';
-    if (hiddenEl) hiddenEl.value = '';
-    return;
-  }
+  if (!name) { nameEl.textContent='—'; avatarEl.textContent=''; avatarEl.style.background=''; if(hiddenEl)hiddenEl.value=''; return; }
   const pal = avatarColor(name);
   avatarEl.textContent = initials(name);
   avatarEl.style.background = pal.bg;
@@ -418,542 +385,386 @@ function updateAssigneeBtn(name) {
   if (hiddenEl) hiddenEl.value = name;
 }
 
-// ─── QUEUE UI ─────────────────────────────────────────────────────────────────
+// ─── QUEUE UI ────────────────────────────────────────────────────────────────
 function renderQueue() {
-  queueDots.innerHTML = '';
+  queuePips.innerHTML = '';
   const total = taskQueue.length;
-  const show = Math.min(total, 18);
-  for (let i = 0; i < show; i++) {
-    const dot = document.createElement('div');
-    dot.className = 'q-dot';
-    queueDots.appendChild(dot);
+  const show = Math.min(total, 20);
+  for (let i=0; i<show; i++) {
+    const d=document.createElement('div'); d.className='q-pip on';
+    queuePips.appendChild(d);
   }
-  if (total === 0) {
-    queueCount.textContent = 'No tasks';
-    queueCount.className = 'queue-count';
-  } else {
-    queueCount.textContent = `${total} tasks`;
-    queueCount.className = 'queue-count loaded';
-  }
+  queueBadge.textContent = total ? `${total} task${total!==1?'s':''}` : 'Empty';
+  queueBadge.style.color = total ? 'var(--accent)' : 'var(--text3)';
 }
 
 function populateDropdown(tasks) {
   taskDropdown.innerHTML = '<option value="">— Select a task —</option>';
-  tasks.forEach(task => {
-    const opt = document.createElement('option');
-    opt.value = task.id;
-    opt.textContent = task.name;
-    opt.dataset.name = task.name;
-    taskDropdown.appendChild(opt);
+  tasks.forEach(t => {
+    const o=document.createElement('option');
+    o.value=t.id; o.textContent=t.name; o.dataset.name=t.name;
+    taskDropdown.appendChild(o);
   });
-  if (tasks.length === 1) {
-    taskDropdown.selectedIndex = 1;
-    onDropdownChange();
-  }
+  if (tasks.length===1) { taskDropdown.selectedIndex=1; onDropdownChange(); }
 }
 
 function onDropdownChange() {
-  const selected = taskDropdown.options[taskDropdown.selectedIndex];
-  if (!selected || !selected.value) {
-    currentTask = null;
-    taskLabel.textContent = 'Select a task above';
-    taskLabel.className = 'task-label';
-    btnStart.disabled = true;
+  const sel = taskDropdown.options[taskDropdown.selectedIndex];
+  if (!sel?.value) {
+    currentTask=null;
+    chipName.textContent='Select a task above ↑';
+    chipName.className='task-chip-name';
+    chipDot.className='task-chip-dot';
+    btnStart.disabled=true;
     return;
   }
-  currentTask = { id: selected.value, name: selected.dataset.name, notionPageId: selected.value };
-  taskLabel.textContent = `Ready: ${currentTask.name}`;
-  taskLabel.className = 'task-label';
-  btnStart.disabled = false;
-  setStatus('Task selected — press Start', '');
+  currentTask = {id:sel.value, name:sel.dataset.name, airtableRecordId:sel.value};
+  chipName.textContent=`Ready: ${currentTask.name}`;
+  chipName.className='task-chip-name';
+  chipDot.className='task-chip-dot';
+  btnStart.disabled=false;
+  setStatus('Task selected — press Start','');
 }
-
 taskDropdown.addEventListener('change', onDropdownChange);
 
-// ─── NOTION FETCH TASKS ───────────────────────────────────────────────────────
-async function fetchTasksFromNotion() {
-  const queryBody = {
-    page_size: 100,
-    filter: {
-      property: config.fields.status,
-      status: { equals: config.statusFilter || 'Not started' }
-    },
-    sorts: [{ timestamp: 'created_time', direction: 'ascending' }],
-  };
-  const data = await notionRequest(
-    `/databases/${config.notionDatabaseId}/query`, 'POST', queryBody
-  );
-  return (data.results || [])
-    .map(page => {
-      const props = page.properties;
-      return {
-        id: page.id,
-        name: extractText(props[config.fields.taskName]) || 'Unnamed Task',
-        assignee: extractText(props[config.fields.assignee]),
-        notionPageId: page.id,
-      };
-    })
-    .filter(t => t.name)
-    .filter(t => {
-      if (!config.assigneeName) return true;
-      return t.assignee.toLowerCase().includes(config.assigneeName.toLowerCase());
+// ─── FETCH TASKS ─────────────────────────────────────────────────────────────
+async function fetchTasksFromAirtable() {
+  const formula = `{${config.fields.status}} = "${config.statusFilter||'Yet to Start'}"`;
+  let records=[], offset=null;
+  do {
+    let url=`${atBase()}?filterByFormula=${encodeURIComponent(formula)}&pageSize=100`;
+    if (offset) url+=`&offset=${encodeURIComponent(offset)}`;
+    const data=await airtableRequest(url);
+    records=records.concat(data.records||[]);
+    offset=data.offset||null;
+  } while(offset);
+
+  const allIds=new Set();
+  records.forEach(rec=>{
+    const raw=rec.fields[config.fields.assignee];
+    if(!raw)return;
+    (Array.isArray(raw)?raw:[raw]).forEach(v=>{
+      const s=typeof v==='object'?v?.id:String(v);
+      if(s?.startsWith('rec')&&s.length>10)allIds.add(s);
     });
+  });
+  if(!Object.keys(employeeMap).length&&allIds.size) await resolveRecordIdsBatch([...allIds]);
+
+  const mapped=records.map(rec=>({
+    id:rec.id, airtableRecordId:rec.id,
+    name:extractField(rec,config.fields.taskName)||'Unnamed Task',
+    assignee:resolveAssigneeField(rec.fields[config.fields.assignee]),
+  }));
+  return mapped.filter(t=>{
+    if(!t.name)return false;
+    if(!config.assigneeName)return true;
+    return t.assignee.split(',').map(s=>s.trim().toLowerCase()).some(n=>n===config.assigneeName.toLowerCase()||n.includes(config.assigneeName.toLowerCase()));
+  });
 }
 
 // ─── TIMER LOGIC ─────────────────────────────────────────────────────────────
 function tick() {
-  if (isPaused || currentBreak) return;
-  const now = Date.now();
-  const display = formatTime(elapsed + (now - startTime));
-  timeDisplay.textContent = display;
-  // keep mini-pill in sync
-  if (isMiniMode) miniTimeSp.textContent = display;
+  if (isPaused||currentBreak) return;
+  clock.textContent = fmtTime(elapsed+(Date.now()-startTime));
 }
 
-async function patchNotionStatus(notionPageId, statusName) {
-  if (!notionPageId || notionPageId === 'manual') return;
-  const res = await fetch(`https://api.notion.com/v1/pages/${notionPageId}`, {
-    method: 'PATCH',
-    headers: {
-      'Authorization': `Bearer ${config.notionToken}`,
-      'Notion-Version': '2022-06-28',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      properties: { [config.fields.status]: { status: { name: statusName } } }
-    })
-  });
-  const data = await res.json();
-  if (!res.ok) { setStatus(`Notion error: ${data.message}`, 'err'); return false; }
-  return true;
+async function patchRecord(id, fields) {
+  if(!id||id==='manual')return false;
+  const data=await airtableRequest(`${atBase()}/${id}`,'PATCH',{fields});
+  return !!data.id;
+}
+
+function fmtDate(date) {
+  if(!date)return '';
+  const d=new Date(date);
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 }
 
 function startTask(taskObj) {
-  elapsed = 0; isPaused = false; currentBreak = null;
-  startTime = Date.now();
-  taskStartWall = new Date();
-  lastEntry = null;
-
+  elapsed=0; isPaused=false; currentBreak=null;
+  startTime=Date.now(); taskStartWall=new Date(); lastEntry=null;
   clearInterval(timerInterval);
-  timerInterval = setInterval(tick, 1000);
+  timerInterval=setInterval(tick,1000);
 
-  timeDisplay.textContent = '00:00:00';
-  timeDisplay.className = 'time running';
-  taskLabel.textContent = taskObj.name;
-  taskLabel.className = 'task-label active';
-
-  btnStart.textContent = '▶ Running';
-  btnStart.disabled = true;
-  taskDropdown.disabled = true;
-  btnRefreshTasks.disabled = true;
-  btnStop.classList.add('active');
-  btnPause.classList.remove('active');
-  btnPause.textContent = '⏸ Pause';
-  btnSync.className = 'btn btn-sync';
+  clock.textContent='00:00:00';
+  clock.className='clock running';
+  chipName.textContent=taskObj.name;
+  chipName.className='task-chip-name active';
+  chipDot.className='task-chip-dot running';
+  btnStart.disabled=true;
+  taskDropdown.disabled=true;
+  btnRefreshTasks.disabled=true;
   resetBreakBtns();
-  setStatus('Running... (syncing Notion)', 'warn');
+  setStatus('Running…','warn');
 
-  // Enter mini mode after a short delay so the user sees the start
-  setTimeout(() => enterMiniMode(taskObj.name), 600);
-
-  const pageId = taskObj.notionPageId;
-  if (pageId && pageId !== 'manual') {
-    fetch(`https://api.notion.com/v1/pages/${pageId}`, {
-      method: 'PATCH',
-      headers: {
-        'Authorization': `Bearer ${config.notionToken}`,
-        'Notion-Version': '2022-06-28',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        properties: {
-          [config.fields.status]:    { status: { name: 'In progress' } },
-          [config.fields.startTime]: { date: { start: taskStartWall.toISOString() } },
-        }
-      })
-    })
-    .then(r => r.json())
-    .then(d => {
-      if (d.object === 'error') setStatus(`Start sync error: ${d.message}`, 'err');
-      else setStatus('Running...', 'warn');
-    })
-    .catch(e => setStatus(`Network error: ${e.message}`, 'err'));
-  } else {
-    setStatus('Running...', 'warn');
+  const recId=taskObj.airtableRecordId;
+  if(recId&&recId!=='manual') {
+    patchRecord(recId,{[config.fields.status]:'In Progress',[config.fields.startTime]:fmtDate(taskStartWall)})
+    .then(ok=>{ if(ok) setStatus('Running…','warn'); else setStatus('Start sync error','err'); })
+    .catch(e=>setStatus(`Network error: ${e.message}`,'err'));
   }
 }
 
 function pauseTimer() {
-  if (!timerInterval || isPaused || currentBreak) return;
-  isPaused = true;
-  elapsed += (Date.now() - startTime);
-  clearInterval(timerInterval); timerInterval = null;
-  timeDisplay.className = 'time paused';
-  taskLabel.className = 'task-label paused';
-  btnPause.classList.add('active');
-  btnPause.textContent = '▶ Resume';
-  setStatus('Paused', 'warn');
+  if(!timerInterval||isPaused||currentBreak)return;
+  isPaused=true; elapsed+=(Date.now()-startTime);
+  clearInterval(timerInterval); timerInterval=null;
+  clock.className='clock paused';
+  chipName.className='task-chip-name';
+  chipDot.className='task-chip-dot paused';
+  btnPause.classList.add('is-paused');
+  btnPause.innerHTML='<svg viewBox="0 0 24 24" style="width:10px;height:10px;stroke:currentColor;fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round"><polygon points="5 3 19 12 5 21 5 3"/></svg>';
+  setStatus('Paused','warn');
 }
 
 function resumeTimer() {
-  if (!isPaused || currentBreak) return;
-  isPaused = false;
-  startTime = Date.now();
-  timerInterval = setInterval(tick, 1000);
-  timeDisplay.className = 'time running';
-  taskLabel.className = 'task-label active';
-  btnPause.classList.remove('active');
-  btnPause.textContent = '⏸ Pause';
-  setStatus('Running...', 'warn');
+  if(!isPaused||currentBreak)return;
+  isPaused=false; startTime=Date.now();
+  timerInterval=setInterval(tick,1000);
+  clock.className='clock running';
+  chipName.className='task-chip-name active';
+  chipDot.className='task-chip-dot running';
+  btnPause.classList.remove('is-paused');
+  btnPause.innerHTML='<svg viewBox="0 0 24 24" style="width:10px;height:10px;stroke:currentColor;fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round"><line x1="10" y1="15" x2="10" y2="9"/><line x1="14" y1="15" x2="14" y2="9"/></svg>';
+  setStatus('Running…','warn');
 }
 
 function startBreak(type) {
-  if (timerInterval && !isPaused) pauseTimer();
-  currentBreak = type; breakStart = Date.now();
-  const labels = { morning: '☀ Morning Break', lunch: '🍱 Lunch Break', evening: '🌙 Evening Break' };
-  taskLabel.textContent = labels[type] || 'Break';
-  taskLabel.className = 'task-label break';
-  timeDisplay.className = 'time break';
-  setBreakBtnActive(type);
-  setStatus(`On ${type} break`, '');
+  if(timerInterval&&!isPaused) pauseTimer();
+  currentBreak=type; breakStart=Date.now();
+  const labels={morning:'Morning Break',lunch:'Lunch Break',evening:'Evening Break'};
+  chipName.textContent=labels[type]||'On Break';
+  chipName.className='task-chip-name';
+  chipDot.className='task-chip-dot paused';
+  setBreakActive(type);
+  setStatus(`On ${type} break`,'');
 }
 
 function endBreak(type) {
-  if (currentBreak !== type) return;
-  currentBreak = null; breakStart = null;
+  if(currentBreak!==type)return;
+  currentBreak=null; breakStart=null;
   resetBreakBtns();
-  if (currentTask) {
-    taskLabel.textContent = currentTask.name;
-    if (isPaused) {
-      taskLabel.className = 'task-label paused';
-      timeDisplay.className = 'time paused';
-      setStatus('Paused — click Resume', 'warn');
-    } else { resumeTimer(); }
+  if(currentTask){
+    chipName.textContent=currentTask.name;
+    if(isPaused){ chipName.className='task-chip-name'; chipDot.className='task-chip-dot paused'; setStatus('Paused','warn'); }
+    else resumeTimer();
   }
 }
 
 function stopTimer() {
-  if (!timerInterval && !isPaused) return;
-  let finalElapsed = elapsed;
-  if (!isPaused && startTime) finalElapsed += (Date.now() - startTime);
+  if(!timerInterval&&!isPaused)return;
+  let finalMs=elapsed;
+  if(!isPaused&&startTime) finalMs+=(Date.now()-startTime);
+  clearInterval(timerInterval); timerInterval=null;
+  isPaused=false; currentBreak=null;
 
-  clearInterval(timerInterval); timerInterval = null;
-  isPaused = false; currentBreak = null;
-
-  const endTimeWall = new Date();
-  lastEntry = {
-    taskName: currentTask ? currentTask.name : 'Unknown Task',
-    notionPageId: currentTask ? currentTask.notionPageId : null,
-    startTime: taskStartWall,
-    endTime: endTimeWall,
-    duration: finalElapsed,
-  };
+  const endWall=new Date();
+  lastEntry={ taskName:currentTask?.name||'Unknown', airtableRecordId:currentTask?.airtableRecordId||null, startTime:taskStartWall, endTime:endWall, duration:finalMs };
   completedTasks.push(lastEntry);
 
-  timeDisplay.className = 'time';
-  btnStart.textContent = '▶ Start';
-  btnStart.disabled = false;
-  taskDropdown.disabled = false;
-  btnRefreshTasks.disabled = false;
-  btnStop.classList.remove('active');
-  btnPause.classList.remove('active');
-  btnPause.textContent = '⏸ Pause';
-  btnSync.className = 'btn btn-sync ready';
+  clock.className='clock done';
+  chipDot.className='task-chip-dot done';
+  chipName.className='task-chip-name done';
+  chipName.textContent=`Done — ${fmtDur(finalMs)}`;
+  btnStart.disabled=false;
+  taskDropdown.disabled=false;
+  btnRefreshTasks.disabled=false;
+  btnSync.classList.add('sync-ready');
   resetBreakBtns();
-
-  const mins = Math.floor(finalElapsed / 60000);
-  const secs = Math.floor((finalElapsed % 60000) / 1000);
-  taskLabel.className = 'task-label';
-  taskLabel.textContent = `Done — ${mins}m ${secs}s`;
-  setStatus('Stopped. Sync to Notion ↑', 'warn');
-
-  // Exit mini mode when timer stops
-  if (isMiniMode) exitMiniMode();
+  setStatus('Stopped — press ↑ to sync','warn');
 }
 
-// ─── BREAK BUTTONS ───────────────────────────────────────────────────────────
-function setBreakBtnActive(type) {
-  [btnMorning, btnLunch, btnEvening].forEach(b => b.classList.remove('active'));
-  if (type === 'morning') btnMorning.classList.add('active');
-  if (type === 'lunch')   btnLunch.classList.add('active');
-  if (type === 'evening') btnEvening.classList.add('active');
+// break buttons
+function setBreakActive(type) {
+  [btnMorning,btnLunch,btnEvening].forEach(b=>b.classList.remove('on'));
+  if(type==='morning')btnMorning.classList.add('on');
+  if(type==='lunch')btnLunch.classList.add('on');
+  if(type==='evening')btnEvening.classList.add('on');
 }
-function resetBreakBtns() {
-  [btnMorning, btnLunch, btnEvening].forEach(b => b.classList.remove('active'));
-}
-function handleBreakBtn(type) {
-  if (currentBreak === type) endBreak(type); else startBreak(type);
-}
-btnMorning.addEventListener('click', () => handleBreakBtn('morning'));
-btnLunch.addEventListener('click',   () => handleBreakBtn('lunch'));
-btnEvening.addEventListener('click', () => handleBreakBtn('evening'));
+function resetBreakBtns() { [btnMorning,btnLunch,btnEvening].forEach(b=>b.classList.remove('on')); }
+function handleBreak(type) { if(currentBreak===type)endBreak(type); else startBreak(type); }
+btnMorning.addEventListener('click',()=>handleBreak('morning'));
+btnLunch.addEventListener('click',()=>handleBreak('lunch'));
+btnEvening.addEventListener('click',()=>handleBreak('evening'));
 
 // ─── BUTTON HANDLERS ─────────────────────────────────────────────────────────
 btnStart.addEventListener('click', () => {
-  if (timerInterval && !isPaused) return;
-  if (currentTask) {
-    startTask(currentTask);
-  } else {
-    manualInput.value = '';
-    manualOverlay.classList.add('visible');
-    manualInput.focus();
-  }
+  if(timerInterval&&!isPaused)return;
+  if(currentTask) startTask(currentTask);
+  else { manualInput.value=''; manualOverlay.classList.add('open'); manualInput.focus(); }
 });
-
-btnPause.addEventListener('click', () => {
-  if (currentBreak) return;
-  if (isPaused) resumeTimer(); else pauseTimer();
-});
-btnStop.addEventListener('click', () => {
-  if (!timerInterval && !isPaused) return;
-  stopTimer();
-});
-btnSync.addEventListener('click', () => {
-  if (!lastEntry) return;
-  syncToNotion(lastEntry);
-});
+btnPause.addEventListener('click', () => { if(currentBreak)return; if(isPaused)resumeTimer(); else pauseTimer(); });
+btnStop.addEventListener('click',  () => { if(!timerInterval&&!isPaused)return; stopTimer(); });
+btnSync.addEventListener('click',  () => { if(lastEntry)syncToAirtable(lastEntry); });
 btnRefreshTasks.addEventListener('click', () => loadTasks());
 btnConfirmManual.addEventListener('click', confirmManual);
-btnCancelManual.addEventListener('click', () => manualOverlay.classList.remove('visible'));
-manualInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') confirmManual();
-  if (e.key === 'Escape') manualOverlay.classList.remove('visible');
+btnCancelManual.addEventListener('click', () => manualOverlay.classList.remove('open'));
+manualInput.addEventListener('keydown', e => {
+  if(e.key==='Enter')confirmManual();
+  if(e.key==='Escape')manualOverlay.classList.remove('open');
 });
 
 function confirmManual() {
-  const name = manualInput.value.trim() || 'Untitled Task';
-  manualOverlay.classList.remove('visible');
-  currentTask = { id: 'manual', name, notionPageId: null };
-  taskLabel.textContent = `Ready: ${currentTask.name}`;
-  taskLabel.className = 'task-label';
-  btnStart.disabled = false;
+  const name=manualInput.value.trim()||'Untitled Task';
+  manualOverlay.classList.remove('open');
+  currentTask={id:'manual',name,airtableRecordId:null};
+  chipName.textContent=`Ready: ${name}`;
+  chipDot.className='task-chip-dot';
+  btnStart.disabled=false;
   startTask(currentTask);
 }
 
-// ─── NOTION SYNC ─────────────────────────────────────────────────────────────
-async function syncToNotion({ taskName, startTime, endTime, duration, notionPageId }) {
-  btnSync.className = 'btn btn-sync syncing';
-  btnSync.textContent = '↻';
-  setStatus('Syncing...', '');
+// ─── SYNC ────────────────────────────────────────────────────────────────────
+async function syncToAirtable({taskName,startTime,endTime,duration,airtableRecordId}) {
+  btnSync.classList.remove('sync-ready');
+  btnSync.innerHTML='<svg class="spin" viewBox="0 0 24 24" style="width:10px;height:10px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>';
+  setStatus('Syncing…','');
 
-  const durationText = formatDuration(duration);
-
+  const durText=fmtDur(duration);
   try {
-    if (notionPageId) {
-      const props = {
-        [config.fields.startTime]: { date: { start: startTime.toISOString() } },
-        [config.fields.endTime]:   { date: { start: endTime.toISOString() } },
-      };
-      if (config.fields.duration) props[config.fields.duration] = { rich_text: [{ text: { content: durationText } }] };
-      if (config.fields.status)   props[config.fields.status] = { status: { name: 'Done' } };
-      await notionRequest(`/pages/${notionPageId}`, 'PATCH', { properties: props });
+    if(airtableRecordId) {
+      const fields={[config.fields.endTime]:fmtDate(endTime),[config.fields.status]:'Done'};
+      if(config.fields.duration) fields[config.fields.duration]=durText;
+      await patchRecord(airtableRecordId,fields);
     } else {
-      const body = {
-        parent: { database_id: config.notionDatabaseId },
-        properties: {
-          [config.fields.taskName]:  { title: [{ text: { content: taskName } }] },
-          [config.fields.startTime]: { date: { start: startTime.toISOString() } },
-          [config.fields.endTime]:   { date: { start: endTime.toISOString() } },
-        }
-      };
-      if (config.fields.duration) body.properties[config.fields.duration] = { rich_text: [{ text: { content: durationText } }] };
-      await notionRequest('/pages', 'POST', body);
+      const fields={[config.fields.taskName]:taskName,[config.fields.startTime]:fmtDate(startTime),[config.fields.endTime]:fmtDate(endTime)};
+      if(config.fields.duration) fields[config.fields.duration]=durText;
+      if(config.assigneeName) fields[config.fields.assignee]=config.assigneeName;
+      await airtableRequest(atBase(),'POST',{fields});
     }
-
-    btnSync.className = 'btn btn-sync synced';
-    btnSync.textContent = '✓';
-    setStatus(`Synced: ${durationText} logged`, 'ok');
-    lastEntry = null;
-
-    setTimeout(() => {
-      btnSync.className = 'btn btn-sync';
-      btnSync.textContent = '↑';
-      loadTasks();
-    }, 2500);
-
-  } catch (e) {
-    btnSync.className = 'btn btn-sync ready';
-    btnSync.textContent = '↑';
-    setStatus(`Sync error: ${e.message}`, 'err');
+    btnSync.classList.add('synced');
+    btnSync.innerHTML='<svg viewBox="0 0 24 24" style="width:10px;height:10px;stroke:currentColor;fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round"><polyline points="20 6 9 17 4 12"/></svg>';
+    setStatus(`Synced: ${durText} logged`,'ok');
+    lastEntry=null;
+    setTimeout(()=>{ btnSync.classList.remove('synced'); btnSync.innerHTML='<svg viewBox="0 0 24 24" style="width:10px;height:10px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>'; loadTasks(); },2500);
+  } catch(e) {
+    btnSync.innerHTML='<svg viewBox="0 0 24 24" style="width:10px;height:10px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>';
+    setStatus(`Sync error: ${e.message}`,'err');
   }
 }
 
 // ─── LOAD TASKS ──────────────────────────────────────────────────────────────
 async function loadTasks() {
-  btnRefreshTasks.textContent = '↻';
-  btnRefreshTasks.style.color = '#F5D503';
-  setLoading('Fetching tasks...', true);
-
+  setLoading('Fetching tasks…',true);
   try {
-    const tasks = await fetchTasksFromNotion();
-    setLoading('', false);
-    btnRefreshTasks.textContent = '↺';
-    btnRefreshTasks.style.color = '#44ff88';
-    setTimeout(() => { btnRefreshTasks.style.color = '#555'; }, 2000);
-
-    if (!tasks || tasks.length === 0) {
-      taskQueue = [];
+    if(!Object.keys(employeeMap).length) await loadEmployeeMap();
+    const tasks=await fetchTasksFromAirtable();
+    setLoading('',false);
+    if(!tasks.length) {
+      taskQueue=[];
       populateDropdown([]);
       renderQueue();
-      taskLabel.textContent = `No "Not started" tasks for ${config.assigneeName}`;
-      taskLabel.className = 'task-label';
-      btnStart.disabled = false;
-      setStatus('No tasks — use manual mode', 'warn');
+      chipName.textContent=`No tasks for ${config.assigneeName||'—'}`;
+      chipDot.className='task-chip-dot';
+      btnStart.disabled=false;
+      setStatus('No tasks — use manual mode','warn');
       return;
     }
-
-    taskQueue = tasks;
+    taskQueue=tasks;
     populateDropdown(tasks);
     renderQueue();
-    // Only reset label/disable if no task was auto-selected by populateDropdown
-    if (!currentTask) {
-      taskLabel.textContent = 'Select a task above ↑';
-      taskLabel.className = 'task-label';
-      btnStart.disabled = true;
-    }
-    setStatus(`${tasks.length} task${tasks.length > 1 ? 's' : ''} loaded`, 'ok');
-
-  } catch (e) {
-    setLoading('', false);
-    btnRefreshTasks.textContent = '↺';
-    btnRefreshTasks.style.color = '#ff4444';
-    setTimeout(() => { btnRefreshTasks.style.color = '#555'; }, 2000);
-    taskQueue = [];
+    if(!currentTask){ chipName.textContent='Select a task ↑'; chipDot.className='task-chip-dot'; btnStart.disabled=true; }
+    setStatus(`${tasks.length} task${tasks.length!==1?'s':''} loaded`,'ok');
+  } catch(e) {
+    setLoading('',false);
+    taskQueue=[];
     populateDropdown([]);
     renderQueue();
-    taskLabel.textContent = 'Could not load tasks — manual mode';
-    taskLabel.className = 'task-label';
-    btnStart.disabled = false;
-    setStatus(`Error: ${e.message}`, 'err');
+    chipName.textContent='Could not load — manual mode';
+    btnStart.disabled=false;
+    setStatus(`Error: ${e.message}`,'err');
   }
 }
 
-// ─── STATS TAB ───────────────────────────────────────────────────────────────
+// ─── STATS ───────────────────────────────────────────────────────────────────
 function renderStats() {
-  const today = new Date();
-  statsTodayDate.textContent = today.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
-
-  // Filter to today's completed tasks
-  const todayStr = today.toDateString();
-  const todayTasks = completedTasks.filter(t => new Date(t.startTime).toDateString() === todayStr);
-
-  const totalMs = todayTasks.reduce((sum, t) => sum + t.duration, 0);
-  statsTotalTime.textContent = formatDuration(totalMs) || '0m';
-  statsTaskCount.textContent = todayTasks.length;
-
-  if (todayTasks.length === 0) {
-    statsHistory.innerHTML = '<div class="stats-empty">No completed tasks yet.<br>Start tracking to see history here.</div>';
-    return;
-  }
-
-  statsHistory.innerHTML = '';
-  // Show most recent first
-  [...todayTasks].reverse().forEach(t => {
-    const row = document.createElement('div');
-    row.className = 'stats-row';
-    row.innerHTML = `
-      <div class="stats-dot"></div>
-      <div class="stats-task-name" title="${t.taskName}">${t.taskName}</div>
-      <div class="stats-dur">${formatDuration(t.duration)}</div>
-    `;
+  const today=new Date();
+  statsTodayDate.textContent=today.toLocaleDateString('en-GB',{day:'numeric',month:'short'});
+  const todayStr=today.toDateString();
+  const todayTasks=completedTasks.filter(t=>new Date(t.startTime).toDateString()===todayStr);
+  const totalMs=todayTasks.reduce((s,t)=>s+t.duration,0);
+  statsTotalTime.textContent=fmtDur(totalMs)||'0m';
+  statsTaskCount.textContent=todayTasks.length;
+  if(!todayTasks.length){ statsHistory.innerHTML='<div class="empty-msg">No completed tasks yet.<br>Start tracking to see history.</div>'; return; }
+  statsHistory.innerHTML='';
+  [...todayTasks].reverse().forEach(t=>{
+    const row=document.createElement('div'); row.className='hist-row';
+    row.innerHTML=`<div class="hist-pip"></div><div class="hist-name" title="${t.taskName}">${t.taskName}</div><div class="hist-dur">${fmtDur(t.duration)}</div>`;
     statsHistory.appendChild(row);
   });
+  document.getElementById('statsUser').textContent=config.assigneeName||'—';
 }
 
-// ─── SETTINGS TAB ────────────────────────────────────────────────────────────
+// ─── SETTINGS ────────────────────────────────────────────────────────────────
 function populateSettings() {
-  // Assignee shown as button, not text input
-  updateAssigneeBtn(config.assigneeName || '');
-  settingStatus.value          = config.statusFilter || 'Not started';
-  settingDbId.value            = config.notionDatabaseId || '';
-  settingFieldTask.value       = config.fields.taskName || '';
-  settingFieldAssignee.value   = config.fields.assignee || '';
-  settingFieldStatus.value     = config.fields.status || '';
-  settingFieldStart.value      = config.fields.startTime || '';
-  settingFieldEnd.value        = config.fields.endTime || '';
-  settingFieldDuration.value   = config.fields.duration || '';
+  updateAssigneeBtn(config.assigneeName||'');
+  settingStatus.value        = config.statusFilter||'Yet to Start';
+  settingBaseId.value        = `${config.airtableBaseId} / ${config.airtableTableId}`;
+  settingFieldTask.value     = config.fields.taskName||'';
+  settingFieldAssignee.value = config.fields.assignee||'';
+  settingFieldStatus.value   = config.fields.status||'';
+  settingFieldStart.value    = config.fields.startTime||'';
+  settingFieldEnd.value      = config.fields.endTime||'';
+  settingFieldDuration.value = config.fields.duration||'';
+  document.getElementById('settingsUser').textContent=config.assigneeName||'—';
 }
 
-// Wire the assignee picker button
-document.getElementById('btnPickAssignee').addEventListener('click', () => {
-  showUserPicker(true);   // true = fromSettings
-});
+document.getElementById('btnPickAssignee').addEventListener('click', () => showUserPicker(true));
 
 btnSaveSettings.addEventListener('click', () => {
-  // Assignee comes from hidden input (set by picker)
-  config.assigneeName       = document.getElementById('settingAssignee').value.trim() || config.assigneeName;
-  config.statusFilter       = settingStatus.value.trim();
-  config.notionDatabaseId   = settingDbId.value.trim();
-  config.fields.taskName    = settingFieldTask.value.trim();
-  config.fields.assignee    = settingFieldAssignee.value.trim();
-  config.fields.status      = settingFieldStatus.value.trim();
-  config.fields.startTime   = settingFieldStart.value.trim();
-  config.fields.endTime     = settingFieldEnd.value.trim();
-  config.fields.duration    = settingFieldDuration.value.trim();
-
+  config.assigneeName    = document.getElementById('settingAssignee').value.trim()||config.assigneeName;
+  config.statusFilter    = settingStatus.value.trim();
+  const dbVal=settingBaseId.value.trim();
+  if(dbVal.includes('/')){
+    const parts=dbVal.split('/').map(s=>s.trim());
+    config.airtableBaseId=parts[0]||config.airtableBaseId;
+    config.airtableTableId=parts[1]||config.airtableTableId;
+  } else if(dbVal) config.airtableBaseId=dbVal;
+  config.fields.taskName  =settingFieldTask.value.trim();
+  config.fields.assignee  =settingFieldAssignee.value.trim();
+  config.fields.status    =settingFieldStatus.value.trim();
+  config.fields.startTime =settingFieldStart.value.trim();
+  config.fields.endTime   =settingFieldEnd.value.trim();
+  config.fields.duration  =settingFieldDuration.value.trim();
   try {
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
-    statusUser.textContent = config.assigneeName || '—';
-    setStatus('Settings saved', 'ok');
-    // Switch back to timer tab and reload
-    document.querySelector('[data-tab="timer"]').click();
+    fs.writeFileSync(CONFIG_PATH,JSON.stringify(config,null,2));
+    statusUser.textContent=config.assigneeName||'—';
+    setStatus('Settings saved','ok');
+    Object.keys(employeeMap).forEach(k=>delete employeeMap[k]);
+    Object.keys(recordNameCache).forEach(k=>delete recordNameCache[k]);
+    document.querySelector('[data-tab="timer"]')?.click();
     loadTasks();
-  } catch (e) {
-    setStatus(`Save error: ${e.message}`, 'err');
-  }
+  } catch(e){ setStatus(`Save error: ${e.message}`,'err'); }
 });
 
-// ─── CHROME TABS (stub — requires native bridge or extension) ─────────────────
-document.getElementById('btnRefreshChrome').addEventListener('click', refreshChromeTabs);
-document.getElementById('btnConnectChrome').addEventListener('click', () => {
-  setStatus('Chrome extension not yet configured', 'warn');
+// ─── CHROME (stub) ───────────────────────────────────────────────────────────
+document.getElementById('btnRefreshChrome').addEventListener('click', () => {
+  document.getElementById('chromeTabsList').innerHTML='<div class="empty-msg">No Chrome tabs detected.<br><button class="chrome-connect-btn" id="btnConnectChrome"><svg viewBox="0 0 24 24" style="width:10px;height:10px;stroke:#fff;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>Connect extension</button></div>';
 });
-
-function refreshChromeTabs() {
-  // If you have a chrome-tabs IPC bridge set up in main.js, call it here:
-  // ipcRenderer.invoke('get-chrome-tabs').then(renderChromeTabs).catch(() => {});
-  //
-  // For now we just show the empty state.
-  const list = document.getElementById('chromeTabsList');
-  list.innerHTML = `<div class="chrome-empty">
-    No Chrome tabs detected.<br>
-    <button class="chrome-connect-btn" id="btnConnectChrome">Connect Chrome Extension</button>
-  </div>`;
-  document.getElementById('btnConnectChrome').addEventListener('click', () => {
-    setStatus('Chrome extension not yet configured', 'warn');
-  });
-}
-
-function renderChromeTabs(tabs) {
-  // Called when you have real tab data from a native bridge
-  const list = document.getElementById('chromeTabsList');
-  if (!tabs || tabs.length === 0) {
-    refreshChromeTabs(); return;
-  }
-  list.innerHTML = '';
-  tabs.forEach(tab => {
-    const item = document.createElement('div');
-    item.className = 'chrome-tab-item';
-    const domain = (() => { try { return new URL(tab.url).hostname; } catch { return ''; } })();
-    item.innerHTML = `
-      <div class="chrome-favicon">
-        ${tab.favIconUrl ? `<img src="${tab.favIconUrl}" width="14" height="14" style="border-radius:2px;">` : '🌐'}
-      </div>
-      <div style="flex:1;overflow:hidden;">
-        <div class="chrome-tab-title">${tab.title || 'Untitled'}</div>
-        <div class="chrome-tab-domain">${domain}</div>
-      </div>
-    `;
+document.getElementById('btnConnectChrome').addEventListener('click', () => setStatus('Chrome extension not configured','warn'));
+ipcRenderer.on('chrome-tabs', (_, tabs) => {
+  const list=document.getElementById('chromeTabsList');
+  if(!tabs?.length){list.innerHTML='<div class="empty-msg">No tabs.</div>';return;}
+  list.innerHTML='';
+  tabs.forEach(tab=>{
+    const domain=(()=>{try{return new URL(tab.url).hostname;}catch{return'';}})();
+    const item=document.createElement('div');
+    item.style.cssText='display:flex;align-items:center;gap:8px;padding:6px 8px;background:var(--surface2);border:1px solid var(--border);border-radius:7px;margin-bottom:4px;';
+    item.innerHTML=`<div style="width:14px;height:14px;border-radius:3px;background:var(--border2);display:flex;align-items:center;justify-content:center;font-size:8px;flex-shrink:0;">${tab.favIconUrl?`<img src="${tab.favIconUrl}" width="12" height="12">`:'🌐'}</div><div style="flex:1;overflow:hidden;"><div style="font-size:10px;color:var(--text1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${tab.title||'Untitled'}</div><div style="font-size:8px;color:var(--text3);">${domain}</div></div>`;
     list.appendChild(item);
   });
-}
-
-// Listen for chrome tabs data if main process ever sends it
-ipcRenderer.on('chrome-tabs', (_, tabs) => renderChromeTabs(tabs));
+});
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 async function init() {
-  statusUser.textContent = config.assigneeName || '—';
+  // Restore sidebar user display if assignee was saved
+  if (config.assigneeName) {
+    const sbAv = document.getElementById('sbAvatar');
+    const sbUname = document.getElementById('sbUname');
+    if (sbAv) { sbAv.textContent=initials(config.assigneeName); const p=avatarColor(config.assigneeName); sbAv.style.background=p.bg; sbAv.style.color=p.color; }
+    if (sbUname) sbUname.textContent=config.assigneeName;
+    statusUser.textContent=config.assigneeName;
+  }
   await showUserPicker();
 }
 
