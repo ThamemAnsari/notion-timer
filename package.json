@@ -1,8 +1,12 @@
 {
   "name": "everest-timer",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Floating timer widget for Team Everest — syncs to Notion",
   "main": "main.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ThamemAnsari/notion-timer.git"
+  },
   "scripts": {
     "start": "electron .",
     "build-mac": "electron-builder --mac",
@@ -11,6 +15,11 @@
   "build": {
     "appId": "ngo.teameverest.timer",
     "productName": "Everest Timer",
+    "publish": {
+      "provider": "github",
+      "owner": "ThamemAnsari",
+      "repo": "notion-timer"
+    },
     "mac": {
       "category": "public.app-category.productivity",
       "target": "dmg",
